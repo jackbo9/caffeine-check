@@ -1,0 +1,1156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Caffeine Check</title>
+</head>
+<body>
+  <div id="root"></div>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel">
+const { useState, useReducer, useEffect, useRef, useCallback } = React;
+
+// ─────────────────────────────────────────────────────────────────
+// DATA
+// ─────────────────────────────────────────────────────────────────
+const BRANDED_DRINKS = [
+  { id: "sbux-latte-tall",       name: "Starbucks Latte",            size: "Tall 12oz",     caffeineMg: 75  },
+  { id: "sbux-latte-grande",     name: "Starbucks Latte",            size: "Grande 16oz",   caffeineMg: 150 },
+  { id: "sbux-latte-venti",      name: "Starbucks Latte",            size: "Venti 20oz",    caffeineMg: 150 },
+  { id: "sbux-americano-tall",   name: "Starbucks Americano",        size: "Tall 12oz",     caffeineMg: 150 },
+  { id: "sbux-americano-grande", name: "Starbucks Americano",        size: "Grande 16oz",   caffeineMg: 225 },
+  { id: "luckin-latte",          name: "Luckin Latte",               size: "Standard",      caffeineMg: 130 },
+  { id: "conv-americano",        name: "Convenience Americano",      size: "Medium",        caffeineMg: 100 },
+  { id: "redbull-250",           name: "Red Bull",                   size: "250ml",         caffeineMg: 80  },
+  { id: "redbull-355",           name: "Red Bull",                   size: "355ml",         caffeineMg: 114 },
+  { id: "monster-500",           name: "Monster Energy",             size: "500ml",         caffeineMg: 160 },
+  { id: "coca-cola-355",         name: "Coca-Cola",                  size: "355ml can",     caffeineMg: 34  },
+  { id: "milk-tea-large",        name: "Bubble Tea",                 size: "Large",         caffeineMg: 50  },
+  { id: "milk-tea-medium",       name: "Bubble Tea",                 size: "Medium",        caffeineMg: 35  },
+];
+
+const COFFEE_TYPES = [
+  { id: "espresso",   name: "Espresso",    mgPerShot: 63,  hasShots: true  },
+  { id: "americano",  name: "Americano",   mgPerShot: 63,  hasShots: true  },
+  { id: "latte",      name: "Latte",       mgPerShot: 63,  hasShots: true  },
+  { id: "cappuccino", name: "Cappuccino",  mgPerShot: 63,  hasShots: true  },
+  { id: "cold-brew",  name: "Cold Brew",   mgPerMl: 0.26,  hasShots: false, hasMl: true  },
+  { id: "pour-over",  name: "Pour-over",   mgPerG: 12,     hasShots: false, hasGrams: true },
+  { id: "drip",       name: "Drip Coffee", mgPerMl: 0.12,  hasShots: false, hasMl: true  },
+];
+
+const TEA_TYPES = [
+  { id: "black-tea", name: "Black Tea",    mgPer240ml: 47 },
+  { id: "green-tea", name: "Green Tea",    mgPer240ml: 28 },
+  { id: "oolong",    name: "Oolong",       mgPer240ml: 37 },
+  { id: "white-tea", name: "White Tea",    mgPer240ml: 20 },
+  { id: "matcha",    name: "Matcha",       mgPer240ml: 70 },
+  { id: "chai",      name: "Chai Tea",     mgPer240ml: 40 },
+];
+
+// ─────────────────────────────────────────────────────────────────
+// CALCULATIONS
+// ─────────────────────────────────────────────────────────────────
+function computeDailyLimit({ weightKg, age, sensitive }) {
+  const weightBased = Math.round(weightKg * 4.5);
+  let base = Math.min(400, weightBased);
+  if (sensitive) base = Math.round(base * 0.65);
+  if (age < 18) base = Math.min(base, 100);
+  if (age < 12) base = Math.min(base, 45);
+  return base;
+}
+
+function computeStatus(consumed, limit) {
+  const r = consumed / limit;
+  if (r > 1.0)  return "over";
+  if (r >= 0.7) return "approaching";
+  return "safe";
+}
+
+function isSingleDrinkLarge(mg, weightKg) {
+  return mg >= 200 || mg >= weightKg * 3;
+}
+
+function estimateCoffeeCaffeine({ typeId, shots, mlAmount, gramsAmount }) {
+  const t = COFFEE_TYPES.find(x => x.id === typeId);
+  if (!t) return 0;
+  if (t.hasShots)  return Math.round((shots || 1) * t.mgPerShot);
+  if (t.hasGrams)  return Math.round((gramsAmount || 15) * t.mgPerG);
+  if (t.hasMl)     return Math.round((mlAmount || 240) * t.mgPerMl);
+  return 0;
+}
+
+function estimateTeaCaffeine({ typeId, mlAmount }) {
+  const t = TEA_TYPES.find(x => x.id === typeId);
+  if (!t) return 0;
+  return Math.round(t.mgPer240ml * ((mlAmount || 240) / 240));
+}
+
+function totalCaffeine(log) {
+  return log.reduce((s, e) => s + e.caffeineMg, 0);
+}
+
+// ── NEW: Caffeine half-life calculation (half-life ~5h = 300min)
+// Returns estimated mg remaining at a future time
+function caffeineAtTime(log, targetMs) {
+  const HALF_LIFE_MS = 5 * 60 * 60 * 1000;
+  return log.reduce((sum, entry) => {
+    const elapsed = targetMs - entry.timestamp;
+    if (elapsed < 0) return sum + entry.caffeineMg;
+    const remaining = entry.caffeineMg * Math.pow(0.5, elapsed / HALF_LIFE_MS);
+    return sum + remaining;
+  }, 0);
+}
+
+// Returns minutes until caffeine drops below threshold
+function minutesUntilBelow(log, thresholdMg) {
+  if (log.length === 0) return 0;
+  const now = Date.now();
+  // Binary search
+  let lo = 0, hi = 24 * 60;
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2;
+    const remaining = caffeineAtTime(log, now + mid * 60 * 1000);
+    if (remaining > thresholdMg) lo = mid;
+    else hi = mid;
+  }
+  return Math.ceil(hi);
+}
+
+// Returns estimated mg still active right now
+function activeCaffeine(log) {
+  return Math.round(caffeineAtTime(log, Date.now()));
+}
+
+// ─────────────────────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────────────────────
+const STORAGE_KEY = "caffeine_check_v2";
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const saved = JSON.parse(raw);
+    // Reset log if it's a new calendar day
+    const savedDate = new Date(saved.savedAt).toDateString();
+    const today = new Date().toDateString();
+    if (savedDate !== today) {
+      return { ...saved, log: [], savedAt: Date.now() };
+    }
+    return saved;
+  } catch { return null; }
+}
+
+function saveState(state) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...state, savedAt: Date.now() }));
+  } catch {}
+}
+
+const initialState = {
+  screen: "setup",
+  profile: null,
+  log: [],
+  simulatedDrink: null,
+};
+
+function reducer(state, action) {
+  switch (action.type) {
+    case "HYDRATE":         return { ...action.state };
+    case "SETUP_COMPLETE":  return { ...state, screen: "dashboard", profile: action.profile, log: [] };
+    case "ADD_DRINK":       return { ...state, log: [...state.log, action.entry], simulatedDrink: null };
+    case "REMOVE_DRINK":    return { ...state, log: state.log.filter(e => e.id !== action.id) };
+    case "RESET_LOG":       return { ...state, log: [], simulatedDrink: null };
+    case "SET_SIMULATION":  return { ...state, simulatedDrink: action.drink };
+    case "CLEAR_SIMULATION":return { ...state, simulatedDrink: null };
+    case "RESET_ALL":       return { ...initialState };
+    default:                return state;
+  }
+}
+
+let _id = 1;
+function newId() { return `d-${_id++}-${Date.now()}`; }
+
+function fmtTime(ts) {
+  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function fmtDuration(minutes) {
+  if (minutes <= 0) return "clear now";
+  if (minutes < 60) return `${minutes}m`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// STATUS CONFIG
+// ─────────────────────────────────────────────────────────────────
+const S = {
+  safe: {
+    label: "Good pace",
+    color: "#2D6A31",
+    colorLight: "#4A8A4E",
+    bg: "linear-gradient(135deg, #EBF5EC 0%, #E0EEE1 100%)",
+    bgSolid: "#EBF5EC",
+    track: "#B8D9BA",
+    arc: "#3E7A42",
+    pill: "#C8E8CA",
+    pillText: "#1C4E20",
+    advice: "You're pacing well. Plenty of room left today.",
+    icon: "◎",
+  },
+  approaching: {
+    label: "Slow down",
+    color: "#8A5A08",
+    colorLight: "#A87010",
+    bg: "linear-gradient(135deg, #FDF0D8 0%, #FAE8C0 100%)",
+    bgSolid: "#FDF0D8",
+    track: "#DEC880",
+    arc: "#B07020",
+    pill: "#EDD090",
+    pillText: "#6A4008",
+    advice: "Getting close. One more is fine — make it count.",
+    icon: "◑",
+  },
+  over: {
+    label: "Time to pause",
+    color: "#922820",
+    colorLight: "#B83830",
+    bg: "linear-gradient(135deg, #FAEAE8 0%, #F5E0DE 100%)",
+    bgSolid: "#FAEAE8",
+    track: "#DCA8A4",
+    arc: "#A83830",
+    pill: "#EEBAБ6",
+    pillText: "#701818",
+    advice: "You've had a full day. Water or herbal tea from here.",
+    icon: "●",
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────
+// ARC GAUGE
+// ─────────────────────────────────────────────────────────────────
+function ArcGauge({ consumed, limit, simulated = 0, status }) {
+  const cfg = S[status];
+  const simStatus = simulated > 0 ? computeStatus(consumed + simulated, limit) : status;
+  const simCfg = S[simStatus];
+
+  // Arc pivot at cy, arc top at cy - R.
+  // We clip canvas from (cy - R - arcPad) to (cy + pivotPad), hiding all empty sky above.
+  const cx = 150, cy = 280;
+  const R = 130, stroke = 18;
+  const arcPad = stroke / 2 + 6;   // clearance above arc top
+  const pivotPad = 14;              // a sliver below the pivot line
+
+  const viewTop = cy - R - arcPad;  // ≈ 136
+  const viewH   = (cy + pivotPad) - viewTop;  // ≈ 158
+  const W = 300;
+
+  function pctToAngle(pct) { return 180 + pct * 180; }
+  function polarXY(deg, r) {
+    const rad = (deg * Math.PI) / 180;
+    return { x: +(cx + r * Math.cos(rad)).toFixed(2), y: +(cy + r * Math.sin(rad)).toFixed(2) };
+  }
+  function arcPath(p1, p2, r) {
+    if (Math.abs(p2 - p1) < 0.001) return null;
+    const s = polarXY(pctToAngle(p1), r);
+    const e = polarXY(pctToAngle(p2), r);
+    return `M ${s.x} ${s.y} A ${r} ${r} 0 ${(p2 - p1) >= 0.9999 ? 1 : 0} 1 ${e.x} ${e.y}`;
+  }
+
+  const cPct = Math.min(consumed / limit, 1);
+  const pPct = simulated > 0 ? Math.min((consumed + simulated) / limit, 1) : cPct;
+
+  const trackPath    = arcPath(0, 1, R);
+  const consumedPath = cPct > 0.005 ? arcPath(0, cPct, R) : null;
+  const simPath      = (simulated > 0 && pPct > cPct) ? arcPath(cPct, pPct, R) : null;
+
+  // Tick marks
+  const TICKS = [
+    { pct: 0.25, len: 6,  width: 1.5, color: "#D8CFC7" },
+    { pct: 0.5,  len: 9,  width: 2,   color: "#C8BFB7" },
+    { pct: 0.7,  len: 12, width: 2.5, color: "#B8AFA7" },
+    { pct: 1.0,  len: 6,  width: 1.5, color: "#D8CFC7" },
+  ];
+
+  // Text — positioned inside the arc mouth, relative to cy
+  const tyLabel  = cy - 76;
+  const tyNumber = cy - 38;
+  const tySub    = cy - 18;
+  const tySim    = cy - 2;
+
+  return (
+    <svg
+      width={W} height={viewH}
+      viewBox={`0 ${viewTop} ${W} ${viewH}`}
+      style={{ display: "block", margin: "0 auto" }}
+    >
+      {/* Track shadow + base */}
+      {trackPath && <path d={trackPath} fill="none" stroke="#00000009" strokeWidth={stroke + 12} strokeLinecap="round" />}
+      {trackPath && <path d={trackPath} fill="none" stroke="#EAE2DA" strokeWidth={stroke} strokeLinecap="round" />}
+      {trackPath && <path d={trackPath} fill="none" stroke="#F5F0EA" strokeWidth={4} strokeLinecap="round" />}
+
+      {/* Consumed arc — layered glow */}
+      {consumedPath && <path d={consumedPath} fill="none" stroke={cfg.arc} strokeWidth={stroke + 22} strokeLinecap="round" opacity="0.08" />}
+      {consumedPath && <path d={consumedPath} fill="none" stroke={cfg.arc} strokeWidth={stroke + 6}  strokeLinecap="round" opacity="0.14" />}
+      {consumedPath && <path d={consumedPath} fill="none" stroke={cfg.arc} strokeWidth={stroke}       strokeLinecap="round" />}
+
+      {/* Simulated extension — dot pattern */}
+      {simPath && <path d={simPath} fill="none" stroke={simCfg.arc} strokeWidth={stroke}
+        strokeLinecap="round" strokeDasharray="3 7" opacity="0.45" />}
+
+      {/* Tick marks */}
+      {TICKS.map(({ pct, len, width, color }) => {
+        const out = polarXY(pctToAngle(pct), R + stroke * 0.5 + len * 0.45);
+        const inn = polarXY(pctToAngle(pct), R - stroke * 0.5 - len * 0.45);
+        return <line key={pct} x1={inn.x} y1={inn.y} x2={out.x} y2={out.y}
+          stroke={color} strokeWidth={width} strokeLinecap="round" />;
+      })}
+
+      {/* Pivot dot — simple clean anchor */}
+      <circle cx={cx} cy={cy} r="7"   fill="#E0D8D0" />
+      <circle cx={cx} cy={cy} r="4.5" fill={cfg.arc} opacity="0.7" />
+      <circle cx={cx} cy={cy} r="2"   fill="white" opacity="0.9" />
+
+      {/* Labels inside arc mouth */}
+      <text x={cx} y={tyLabel} textAnchor="middle"
+        style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 9, fill: "#A89888", letterSpacing: "2.5px" }}>
+        SO FAR TODAY
+      </text>
+      <text x={cx} y={tyNumber} textAnchor="middle"
+        style={{ fontFamily: "'DM Serif Display',serif", fontSize: 44, fill: cfg.color, letterSpacing: "-1px" }}>
+        {consumed}
+      </text>
+      <text x={cx} y={tySub} textAnchor="middle"
+        style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, fill: "#9A8E84" }}>
+        of ~{limit} mg
+      </text>
+      {simulated > 0 && (
+        <text x={cx} y={tySim} textAnchor="middle"
+          style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10.5, fill: simCfg.colorLight, fontWeight: 600 }}>
+          → {consumed + simulated} mg with this drink
+        </text>
+      )}
+    </svg>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// NEW: Half-life countdown card — the "wow" differentiator
+// ─────────────────────────────────────────────────────────────────
+function HalfLifeCard({ log, profile }) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 30000); // update every 30s
+    return () => clearInterval(id);
+  }, []);
+
+  if (log.length === 0) return null;
+
+  const active = activeCaffeine(log);
+  const threshold = 30; // mg considered "clear"
+  const minsUntilClear = minutesUntilBelow(log, threshold);
+
+  // Bedtime check
+  let bedtimeWarning = null;
+  if (profile.bedtime) {
+    const [bh, bm] = profile.bedtime.split(":").map(Number);
+    const now = new Date();
+    let bedtimeMs = new Date(now.getFullYear(), now.getMonth(), now.getDate(), bh, bm).getTime();
+    if (bedtimeMs < now.getTime()) bedtimeMs += 86400000; // tomorrow
+    const minsUntilBed = Math.round((bedtimeMs - now.getTime()) / 60000);
+    const mgAtBedtime = Math.round(caffeineAtTime(log, bedtimeMs));
+    if (mgAtBedtime > 50) {
+      bedtimeWarning = { minsUntilBed, mgAtBedtime };
+    }
+  }
+
+  const activeRatio = Math.min(active / 400, 1);
+  const activeStatus = active > 200 ? "over" : active > 100 ? "approaching" : "safe";
+  const cfg = S[activeStatus];
+
+  return (
+    <div style={{
+      background: "linear-gradient(135deg, #1A1208 0%, #2A1C10 100%)",
+      borderRadius: 20,
+      padding: "18px 20px",
+      border: "1px solid #3A2A18",
+      boxShadow: "0 4px 20px rgba(0,0,0,0.3)",
+      position: "relative",
+      overflow: "hidden",
+    }}>
+      {/* Background glow */}
+      <div style={{
+        position: "absolute", top: -30, right: -30,
+        width: 120, height: 120, borderRadius: "50%",
+        background: cfg.arc,
+        opacity: 0.08,
+        filter: "blur(30px)",
+      }} />
+
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 14 }}>
+        <div>
+          <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 9, letterSpacing: 2.5, color: "#7A6A58", textTransform: "uppercase", marginBottom: 5 }}>
+            Active in your body right now
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+            <span style={{ fontFamily: "'DM Serif Display',serif", fontSize: 42, color: "#F5E8D8", letterSpacing: -1, lineHeight: 1 }}>
+              {active}
+            </span>
+            <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 13, color: "#8A7A6A" }}>mg active</span>
+          </div>
+        </div>
+
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 9, letterSpacing: 2, color: "#7A6A58", textTransform: "uppercase", marginBottom: 5 }}>
+            Clears in ~
+          </div>
+          <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 28, color: cfg.colorLight, lineHeight: 1 }}>
+            {fmtDuration(minsUntilClear)}
+          </div>
+        </div>
+      </div>
+
+      {/* Activity bar */}
+      <div style={{ height: 4, background: "#3A2A18", borderRadius: 99, overflow: "hidden", marginBottom: 12 }}>
+        <div style={{
+          height: "100%",
+          width: `${activeRatio * 100}%`,
+          background: `linear-gradient(90deg, ${cfg.arc}, ${cfg.colorLight})`,
+          borderRadius: 99,
+          transition: "width 0.8s ease",
+        }} />
+      </div>
+
+      {bedtimeWarning && (
+        <div style={{
+          padding: "8px 12px", borderRadius: 10,
+          background: "rgba(184, 100, 0, 0.2)",
+          border: "1px solid rgba(184, 100, 0, 0.35)",
+          fontFamily: "'DM Sans',sans-serif", fontSize: 12, color: "#E8A840",
+          lineHeight: 1.4,
+        }}>
+          ⏰ ~{bedtimeWarning.mgAtBedtime} mg still active at bedtime ({profile.bedtime}) — may affect sleep quality.
+        </div>
+      )}
+
+      <div style={{ marginTop: bedtimeWarning ? 10 : 0, fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: "#5A4A38", lineHeight: 1.5 }}>
+        Half-life ~5 hrs · {log.length} drink{log.length !== 1 ? "s" : ""} logged today
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SETUP CARD — streamlined, skip-able
+// ─────────────────────────────────────────────────────────────────
+function SetupCard({ onComplete }) {
+  const [age, setAge]       = useState(28);
+  const [weight, setWeight] = useState(68);
+  const [sensitive, setSens]= useState(false);
+  const [bedtime, setBedtime] = useState("23:00");
+  const [step, setStep]     = useState(0); // 0 = basics, 1 = details
+  const [error, setError]   = useState("");
+
+  const previewLimit = (age >= 5 && age <= 120 && weight >= 20 && weight <= 300)
+    ? computeDailyLimit({ weightKg: weight, age, sensitive }) : null;
+
+  function handleSubmit() {
+    if (!age || age < 5 || age > 120)          { setError("Please enter a valid age (5–120)."); return; }
+    if (!weight || weight < 20 || weight > 300) { setError("Please enter a valid weight (20–300 kg)."); return; }
+    const limit = computeDailyLimit({ weightKg: weight, age, sensitive });
+    onComplete({ age: +age, weightKg: +weight, sensitive, bedtime, dailyLimit: limit });
+  }
+
+  function handleQuickStart() {
+    // Use defaults: 28y, 68kg
+    const limit = computeDailyLimit({ weightKg: 68, age: 28, sensitive: false });
+    onComplete({ age: 28, weightKg: 68, sensitive: false, bedtime: "23:00", dailyLimit: limit });
+  }
+
+  return (
+    <div style={T.card}>
+      <div style={{ marginBottom: 24 }}>
+        <div style={T.eyebrow}>Your daily companion</div>
+        <h1 style={{ fontFamily: "'DM Serif Display',serif", fontSize: 34, color: "#2E1C0E", lineHeight: 1.05, marginBottom: 10 }}>
+          Know your caffeine,<br/>trust your day.
+        </h1>
+        <p style={T.bodyMuted}>
+          Tell us a little about yourself for a personalised daily reference. Or just jump in with defaults.
+        </p>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 14px" }}>
+        <div style={T.fieldGroup}>
+          <label style={T.label}>Age</label>
+          <input type="number" value={age} min={5} max={120}
+            onChange={e => setAge(+e.target.value)} style={T.input} />
+        </div>
+        <div style={T.fieldGroup}>
+          <label style={T.label}>Weight (kg)</label>
+          <input type="number" value={weight} min={20} max={300}
+            onChange={e => setWeight(+e.target.value)} style={T.input} />
+        </div>
+      </div>
+
+      <div style={{ ...T.fieldGroup, flexDirection: "row", alignItems: "center" }}>
+        <label style={{ ...T.label, marginBottom: 0, flex: 1 }}>I feel caffeine more than most</label>
+        <button onClick={() => setSens(s => !s)} style={{
+          padding: "7px 18px", borderRadius: 99, border: "none", cursor: "pointer",
+          fontFamily: "'DM Sans',sans-serif", fontSize: 13, fontWeight: 600,
+          transition: "all 0.18s",
+          background: sensitive ? "#5E3D24" : "#EDE7DF",
+          color: sensitive ? "#FFF7F0" : "#8A7A6C",
+        }}>
+          {sensitive ? "Yes, a bit" : "Not really"}
+        </button>
+      </div>
+
+      <div style={T.fieldGroup}>
+        <label style={T.label}>Bedtime <span style={{ color: "#C4B8AD", fontWeight: 400 }}>(for sleep impact warning)</span></label>
+        <input type="time" value={bedtime} onChange={e => setBedtime(e.target.value)} style={T.input} />
+      </div>
+
+      {previewLimit && (
+        <div style={{
+          background: "linear-gradient(135deg, #FDF5E8 0%, #F8EDDA 100%)",
+          borderRadius: 16, padding: "16px 18px", marginBottom: 18,
+          border: "1px solid #E8D9B8",
+        }}>
+          <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: "#A08050", letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 4 }}>
+            Your comfortable daily reference
+          </div>
+          <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 40, color: "#5E3D24", lineHeight: 1 }}>
+            ~{previewLimit} <span style={{ fontSize: 18, color: "#9A7050" }}>mg / day</span>
+          </div>
+          {age < 18 && (
+            <div style={{ fontSize: 11, color: "#B5821A", marginTop: 6, fontFamily: "'DM Sans',sans-serif" }}>
+              ⚠ Under 18: reduced limits apply
+            </div>
+          )}
+        </div>
+      )}
+
+      {error && <p style={{ color: "#B84B3C", fontSize: 13, fontFamily: "'DM Sans',sans-serif", marginBottom: 10 }}>{error}</p>}
+
+      <button onClick={handleSubmit} style={T.primaryBtn}>
+        Start tracking →
+      </button>
+
+      <button onClick={handleQuickStart} style={{
+        display: "block", width: "100%", padding: "11px 20px", marginTop: 8,
+        borderRadius: 14, border: "1.5px solid #E3D9CF",
+        background: "transparent",
+        color: "#9A8878",
+        fontFamily: "'DM Sans',sans-serif", fontSize: 14, fontWeight: 600, cursor: "pointer",
+      }}>
+        Skip — use defaults
+      </button>
+
+      <p style={T.disclaimer}>Estimates only. Not medical advice. Everyone responds to caffeine differently.</p>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DASHBOARD HERO
+// ─────────────────────────────────────────────────────────────────
+function DashboardCard({ profile, consumed, limit, simulated, status, activeMg, log, onReset }) {
+  const cfg = S[status];
+  const remaining = Math.max(0, limit - consumed);
+  const projectedTotal = consumed + simulated;
+  const projectedStatus = simulated > 0 ? computeStatus(projectedTotal, limit) : status;
+  const projectedCfg = S[projectedStatus];
+
+  const consumedPct = Math.min((consumed / limit) * 100, 100);
+  const remainingPct = Math.max(0, 100 - consumedPct);
+  const projectedPct = simulated > 0 ? Math.min((simulated / limit) * 100, remainingPct) : 0;
+
+  return (
+    <section style={{
+      background: "linear-gradient(165deg, #FFFDF9 0%, #F7F1E8 72%, #F2E9DD 100%)",
+      borderRadius: 28,
+      padding: "20px 20px 18px",
+      border: "1px solid #E7DDD1",
+      boxShadow: "0 8px 32px rgba(82,58,33,0.10)",
+    }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 4 }}>
+        <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10.5, color: "#9D8D7E", lineHeight: 1.5 }}>
+          {profile.age}y · {profile.weightKg}kg{profile.sensitive ? " · Sensitive" : ""}{profile.bedtime ? ` · Bed ${profile.bedtime}` : ""}
+        </div>
+        <button onClick={onReset} style={{ border: "none", background: "transparent", cursor: "pointer", fontFamily: "'DM Sans',sans-serif", fontSize: 11.5, color: "#C4B8AD", padding: 0 }}>
+          Reset
+        </button>
+      </div>
+
+      {/* Gauge — the centrepiece */}
+      <ArcGauge consumed={consumed} limit={limit} simulated={simulated} status={status} />
+
+      {/* Status pill */}
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 14 }}>
+        <div style={{
+          padding: "5px 16px", borderRadius: 99,
+          background: cfg.bg, border: `1px solid ${cfg.track}`,
+          fontFamily: "'DM Sans',sans-serif", fontSize: 12, fontWeight: 700, color: cfg.color,
+          letterSpacing: 0.3,
+        }}>
+          {cfg.icon} {cfg.label}
+        </div>
+      </div>
+
+      {/* Progress bar */}
+      <div style={{
+        padding: "14px 14px 12px",
+        borderRadius: 16,
+        border: "1px solid #E5DACC",
+        background: "#FFFCF7",
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 7 }}>
+          <span style={{ ...T.barLabel, color: "#7F6F60" }}>Consumed</span>
+          <span style={{ ...T.barLabel, color: "#7F6F60" }}>Room left</span>
+        </div>
+        <div style={{ height: 48, borderRadius: 12, background: "#EEE3D6", overflow: "hidden", position: "relative" }}>
+          <div style={{ position: "absolute", inset: 0, background: "repeating-linear-gradient(135deg, #F7EFE4 0, #F7EFE4 8px, #F2E8DB 8px, #F2E8DB 16px)" }} />
+          <div style={{
+            position: "absolute", left: 0, top: 0, bottom: 0,
+            width: `${consumedPct}%`,
+            background: "linear-gradient(90deg, #B9A18B 0%, #8B6A4E 100%)",
+            transition: "width 0.5s cubic-bezier(0.4,0,0.2,1)",
+          }} />
+          {simulated > 0 && projectedPct > 0 && (
+            <div style={{
+              position: "absolute", left: `${consumedPct}%`, top: 0, bottom: 0,
+              width: `${projectedPct}%`,
+              background: "repeating-linear-gradient(135deg, #C8971F, #C8971F 6px, #E5BD5C 6px, #E5BD5C 12px)",
+              opacity: 0.75,
+            }} />
+          )}
+          <div style={{ position: "absolute", top: 0, bottom: 0, left: "70%", width: 1.5, background: "#FFFFFFB0" }} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 7 }}>
+          <span style={T.barLabel}>{consumed} mg consumed</span>
+          <span style={T.barLabel}>{remaining} mg left</span>
+        </div>
+
+        {simulated > 0 && (
+          <div style={{
+            marginTop: 10, padding: "9px 12px", borderRadius: 10,
+            border: `1px solid ${projectedCfg.track}`,
+            background: projectedCfg.bg,
+            fontFamily: "'DM Sans',sans-serif", fontSize: 12, color: projectedCfg.color, lineHeight: 1.45,
+          }}>
+            With this drink: {projectedTotal} mg total · {Math.max(0, limit - projectedTotal)} mg remaining
+          </div>
+        )}
+      </div>
+
+      <p style={{ marginTop: 10, fontFamily: "'DM Sans',sans-serif", fontSize: 12.5, color: cfg.color, lineHeight: 1.5 }}>
+        {cfg.advice}
+      </p>
+    </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ADD DRINK PANEL
+// ─────────────────────────────────────────────────────────────────
+function AddDrinkPanel({ profile, consumed, limit, onAdd, onSimulate }) {
+  const [category, setCategory]   = useState("branded");
+  const [brandedId, setBrandedId] = useState(BRANDED_DRINKS[0].id);
+  const [coffeeTypeId, setCoffee] = useState("espresso");
+  const [shots, setShots]         = useState(2);
+  const [mlAmount, setMlAmount]   = useState(240);
+  const [gramsAmount, setGrams]   = useState(15);
+  const [teaTypeId, setTea]       = useState("black-tea");
+  const [teaMl, setTeaMl]         = useState(240);
+  const [softMg, setSoftMg]       = useState(34);
+  const [softName, setSoftName]   = useState("Soda");
+  const [added, setAdded]         = useState(false);
+
+  const coffeeType = COFFEE_TYPES.find(t => t.id === coffeeTypeId);
+
+  const CATS = [
+    { id: "branded", label: "Brands" },
+    { id: "coffee",  label: "Coffee" },
+    { id: "tea",     label: "Tea"    },
+    { id: "soft",    label: "Other"  },
+  ];
+
+  function buildEntry(id) {
+    const ts = Date.now();
+    if (category === "branded") {
+      const d = BRANDED_DRINKS.find(b => b.id === brandedId);
+      return { id, category: "branded", name: `${d.name} · ${d.size}`, caffeineMg: d.caffeineMg, timestamp: ts };
+    }
+    if (category === "coffee") {
+      const ct = COFFEE_TYPES.find(t => t.id === coffeeTypeId);
+      const mg = estimateCoffeeCaffeine({ typeId: coffeeTypeId, shots, mlAmount, gramsAmount });
+      const sl = ct.hasShots ? ` · ${shots} shot${shots !== 1 ? "s" : ""}` : "";
+      return { id, category: "coffee", name: `${ct.name}${sl}`, caffeineMg: mg, timestamp: ts };
+    }
+    if (category === "tea") {
+      const tt = TEA_TYPES.find(t => t.id === teaTypeId);
+      const mg = estimateTeaCaffeine({ typeId: teaTypeId, mlAmount: teaMl });
+      return { id, category: "tea", name: `${tt.name} · ${teaMl}ml`, caffeineMg: mg, timestamp: ts };
+    }
+    return { id, category: "soft", name: softName.trim() || "Drink", caffeineMg: softMg, timestamp: ts };
+  }
+
+  const previewEntry = buildEntry("preview");
+  const previewMg = previewEntry.caffeineMg;
+  const isLarge = isSingleDrinkLarge(previewMg, profile.weightKg);
+  const projectedRemaining = Math.max(0, limit - consumed - previewMg);
+  const projectedStatus = computeStatus(consumed + previewMg, limit);
+  const projectedCfg = S[projectedStatus];
+
+  useEffect(() => {
+    onSimulate({ ...previewEntry, id: `sim-${category}` });
+  }, [category, brandedId, coffeeTypeId, shots, mlAmount, gramsAmount, teaTypeId, teaMl, softMg, softName]);
+
+  function handleAdd() {
+    const e = buildEntry(newId());
+    if (e) {
+      onAdd(e);
+      setAdded(true);
+      setTimeout(() => setAdded(false), 1500);
+    }
+  }
+
+  return (
+    <div style={{ ...T.card, paddingTop: 18 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 14 }}>
+        <h2 style={{ fontFamily: "'DM Serif Display',serif", fontSize: 24, color: "#2E1C0E", lineHeight: 1.1 }}>
+          Log a drink
+        </h2>
+        <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: "#C4B8AD" }}>
+          previewing impact live ↑
+        </span>
+      </div>
+
+      {/* Category tabs */}
+      <div style={{ display: "flex", background: "#F3EDE5", borderRadius: 11, padding: 3, marginBottom: 16, gap: 2 }}>
+        {CATS.map(c => (
+          <button key={c.id} onClick={() => setCategory(c.id)} style={{
+            flex: 1, padding: "7px 0", borderRadius: 8, border: "none", cursor: "pointer",
+            fontFamily: "'DM Sans',sans-serif", fontSize: 12.5, fontWeight: 600,
+            transition: "all 0.15s",
+            background: category === c.id ? "#FFFFFF" : "transparent",
+            color: category === c.id ? "#3D2B1A" : "#9A8E84",
+            boxShadow: category === c.id ? "0 1px 6px rgba(90,60,30,0.10)" : "none",
+          }}>{c.label}</button>
+        ))}
+      </div>
+
+      <div style={{ minHeight: 80 }}>
+        {category === "branded" && (
+          <select value={brandedId} onChange={e => setBrandedId(e.target.value)} style={T.input}>
+            {BRANDED_DRINKS.map(d => <option key={d.id} value={d.id}>{d.name} — {d.size} ({d.caffeineMg}mg)</option>)}
+          </select>
+        )}
+
+        {category === "coffee" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <select value={coffeeTypeId} onChange={e => setCoffee(e.target.value)} style={T.input}>
+              {COFFEE_TYPES.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+            {coffeeType?.hasShots && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 13, color: "#6B5748" }}>Espresso shots</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <button onClick={() => setShots(s => Math.max(1, s - 1))} style={T.stepBtn}>−</button>
+                  <span style={{ fontFamily: "'DM Serif Display',serif", fontSize: 26, color: "#3D2B1A", minWidth: 22, textAlign: "center" }}>{shots}</span>
+                  <button onClick={() => setShots(s => Math.min(6, s + 1))} style={T.stepBtn}>+</button>
+                </div>
+              </div>
+            )}
+            {coffeeType?.hasGrams && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <label style={T.label}>Coffee grounds (g)</label>
+                <input type="number" value={gramsAmount} min={5} max={60}
+                  onChange={e => setGrams(+e.target.value)} style={{ ...T.input, width: 90, textAlign: "center" }} />
+              </div>
+            )}
+            {coffeeType?.hasMl && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <label style={T.label}>Amount (ml)</label>
+                <input type="number" value={mlAmount} min={60} max={1000}
+                  onChange={e => setMlAmount(+e.target.value)} style={{ ...T.input, width: 90, textAlign: "center" }} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {category === "tea" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <select value={teaTypeId} onChange={e => setTea(e.target.value)} style={T.input}>
+              {TEA_TYPES.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <label style={T.label}>Cup size (ml)</label>
+              <input type="number" value={teaMl} min={100} max={600}
+                onChange={e => setTeaMl(+e.target.value)} style={{ ...T.input, width: 90, textAlign: "center" }} />
+            </div>
+          </div>
+        )}
+
+        {category === "soft" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <input type="text" value={softName} placeholder="Drink name"
+              onChange={e => setSoftName(e.target.value)} style={T.input} />
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <label style={T.label}>Caffeine (mg)</label>
+              <input type="number" value={softMg} min={0} max={500}
+                onChange={e => setSoftMg(parseFloat(e.target.value) || 0)} style={{ ...T.input, width: 90, textAlign: "center" }} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Preview pill */}
+      <div style={{
+        marginTop: 14, padding: "12px 14px", borderRadius: 13,
+        background: projectedCfg.bg,
+        border: `1px solid ${projectedCfg.track}`,
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+      }}>
+        <div>
+          <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: "#A08870", textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 2 }}>
+            This drink
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+            <span style={{ fontFamily: "'DM Serif Display',serif", fontSize: 30, color: "#5E3D24" }}>+{previewMg}</span>
+            <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 13, color: "#9A7A5A" }}>mg</span>
+          </div>
+          <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11.5, color: projectedCfg.color, marginTop: 2 }}>
+            {projectedRemaining} mg left after
+          </div>
+        </div>
+        {isLarge && (
+          <div style={{
+            padding: "5px 12px", borderRadius: 99,
+            background: "#FDF0D8", border: "1px solid #E8C878",
+            fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: "#9A6A10", fontWeight: 700,
+          }}>Strong pour</div>
+        )}
+      </div>
+
+      <button onClick={handleAdd} style={{
+        ...T.primaryBtn,
+        marginTop: 12,
+        background: added
+          ? "linear-gradient(135deg, #3E7A42, #2D6A31)"
+          : "linear-gradient(135deg, #7A4F2E, #5E3D24)",
+        transition: "background 0.3s ease",
+      }}>
+        {added ? "✓ Logged!" : "Log this drink"}
+      </button>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DRINK LOG
+// ─────────────────────────────────────────────────────────────────
+function DrinkLogList({ log, onRemove }) {
+  if (log.length === 0) return (
+    <div style={{
+      ...T.card,
+      textAlign: "center", padding: "24px 20px",
+      background: "#FDFAF6",
+      border: "1.5px dashed #E3D9CF",
+      boxShadow: "none",
+    }}>
+      <div style={{ fontSize: 22, marginBottom: 8, opacity: 0.3 }}>— — —</div>
+      <p style={{ fontFamily: "'DM Serif Display',serif", fontSize: 16, color: "#B0A398", marginBottom: 4 }}>
+        Nothing logged yet
+      </p>
+      <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12.5, color: "#C4B8AD", lineHeight: 1.5 }}>
+        Log a drink above to start tracking.
+      </p>
+    </div>
+  );
+
+  const totalMg = log.reduce((s, e) => s + e.caffeineMg, 0);
+
+  return (
+    <div style={T.card}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <h2 style={{ fontFamily: "'DM Serif Display',serif", fontSize: 19, color: "#2E1C0E" }}>Today's log</h2>
+        <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 12, color: "#C4B8AD" }}>
+          {log.length} drink{log.length !== 1 ? "s" : ""} · {totalMg} mg
+        </span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {[...log].reverse().map((e, i) => {
+          const active = Math.round(e.caffeineMg * Math.pow(0.5, (Date.now() - e.timestamp) / (5 * 3600 * 1000)));
+          const decayPct = Math.round((active / e.caffeineMg) * 100);
+          return (
+            <div key={e.id} style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+              padding: "10px 13px",
+              background: i === 0 ? "linear-gradient(135deg, #FAF6F0, #F6F0E8)" : "#FAFAF8",
+              borderRadius: 12,
+              border: i === 0 ? "1px solid #E8DECE" : "1px solid #EDEBE6",
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 13.5, color: "#3D2B1A", fontWeight: 600 }}>{e.name}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3 }}>
+                  <span style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: "#C4B8AD" }}>
+                    {fmtTime(e.timestamp)}
+                  </span>
+                  <span style={{ width: 2, height: 2, borderRadius: 99, background: "#D8CECC", display: "inline-block", flexShrink: 0 }} />
+                  <span style={{
+                    fontFamily: "'DM Sans',sans-serif", fontSize: 10.5,
+                    color: decayPct > 60 ? "#A07830" : "#B0A898",
+                    background: decayPct > 60 ? "#FBF0DC" : "transparent",
+                    padding: decayPct > 60 ? "1px 6px" : "0",
+                    borderRadius: 99,
+                  }}>
+                    ~{active} mg active
+                  </span>
+                </div>
+              </div>
+              <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 17, color: "#6B5748", marginRight: 12 }}>
+                {e.caffeineMg}<span style={{ fontSize: 10, color: "#AFA39A" }}> mg</span>
+              </div>
+              <button onClick={() => onRemove(e.id)} style={{
+                background: "transparent", border: "none", cursor: "pointer",
+                color: "#D4C9BC", fontSize: 13, padding: "3px 5px", borderRadius: 6,
+                fontFamily: "'DM Sans',sans-serif",
+              }}>✕</button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// APP
+// ─────────────────────────────────────────────────────────────────
+function App() {
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const { screen, profile, log, simulatedDrink } = state;
+
+  // Hydrate from localStorage on mount
+  useEffect(() => {
+    const saved = loadState();
+    if (saved && saved.profile) {
+      dispatch({ type: "HYDRATE", state: { ...saved, simulatedDrink: null } });
+    }
+  }, []);
+
+  // Persist on every state change
+  useEffect(() => {
+    if (state.profile) saveState(state);
+  }, [state]);
+
+  // Live re-render ticker for active caffeine
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  const consumed = totalCaffeine(log);
+  const limit    = profile?.dailyLimit ?? 400;
+  const status   = computeStatus(consumed, limit);
+  const simMg    = simulatedDrink?.caffeineMg ?? 0;
+  const active   = activeCaffeine(log);
+
+  const today = new Date().toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" });
+
+  return (
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap');
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html { -webkit-font-smoothing: antialiased; background: #F0E8DE; }
+        body { background: #F0E8DE; min-height: 100vh; font-family: 'DM Sans', sans-serif; }
+        input[type=number], input[type=time], select { -webkit-appearance: none; appearance: none; }
+        input:focus, select:focus, button:focus-visible { outline: 2px solid #C8971F80; outline-offset: 2px; }
+        select { cursor: pointer; }
+
+        @keyframes fadeUp {
+          from { opacity: 0; transform: translateY(18px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes scaleIn {
+          from { opacity: 0; transform: scale(0.96); }
+          to   { opacity: 1; transform: scale(1); }
+        }
+        .fu  { animation: fadeUp  0.44s cubic-bezier(0.22,1,0.36,1) both; }
+        .si  { animation: scaleIn 0.36s cubic-bezier(0.22,1,0.36,1) both; }
+        .fu1 { animation-delay: 0.04s; }
+        .fu2 { animation-delay: 0.10s; }
+        .fu3 { animation-delay: 0.18s; }
+        .fu4 { animation-delay: 0.25s; }
+        .fu5 { animation-delay: 0.32s; }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #D4C8BC; border-radius: 2px; }
+      `}</style>
+
+      <div style={{ maxWidth: 480, marginInline: "auto", padding: "0 16px 36px" }}>
+
+        {/* Header */}
+        <div style={{ padding: screen === "setup" ? "36px 4px 24px" : "28px 4px 16px", display: "flex", alignItems: "flex-end", justifyContent: "space-between" }}>
+          <div>
+            <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 9.5, letterSpacing: 3.5, textTransform: "uppercase", color: "#A89880", marginBottom: 6 }}>
+              Caffeine Check
+            </div>
+            <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: screen === "setup" ? 26 : 22, color: "#2E1C0E", lineHeight: 1.1 }}>
+              {screen === "setup" ? "How much is\ntoo much today?" : "How's your day going?"}
+            </div>
+          </div>
+          {screen === "dashboard" && (
+            <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 11, color: "#BDB0A4", textAlign: "right", lineHeight: 1.5 }}>
+              {today}
+            </div>
+          )}
+        </div>
+
+        {screen === "setup" && (
+          <div className="si">
+            <SetupCard onComplete={p => dispatch({ type: "SETUP_COMPLETE", profile: p })} />
+          </div>
+        )}
+
+        {screen === "dashboard" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div className="fu fu1">
+              <DashboardCard
+                profile={profile}
+                consumed={consumed}
+                limit={limit}
+                simulated={simMg}
+                status={status}
+                activeMg={active}
+                log={log}
+                onReset={() => dispatch({ type: "RESET_ALL" })}
+              />
+            </div>
+
+            {/* Half-life card — the differentiator */}
+            {log.length > 0 && (
+              <div className="fu fu2">
+                <HalfLifeCard log={log} profile={profile} />
+              </div>
+            )}
+
+            <div className="fu fu3">
+              <AddDrinkPanel
+                profile={profile}
+                consumed={consumed}
+                limit={limit}
+                onAdd={e => dispatch({ type: "ADD_DRINK", entry: e })}
+                onSimulate={d => dispatch({ type: "SET_SIMULATION", drink: d })}
+              />
+            </div>
+
+            <div className="fu fu4">
+              <DrinkLogList
+                log={log}
+                onRemove={id => dispatch({ type: "REMOVE_DRINK", id })}
+              />
+            </div>
+
+            {log.length > 0 && (
+              <div className="fu fu5" style={{ textAlign: "center" }}>
+                <button onClick={() => dispatch({ type: "RESET_LOG" })} style={{
+                  border: "none", background: "transparent", cursor: "pointer",
+                  fontFamily: "'DM Sans',sans-serif", fontSize: 12.5, color: "#C4B8AD",
+                  padding: "8px 16px", borderRadius: 10,
+                }}>
+                  Clear today's log
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Footer */}
+        <div style={{ padding: "16px 4px 0", textAlign: "center" }}>
+          <div style={{ width: 28, height: 1, background: "#D8D0C8", margin: "0 auto 12px" }} />
+          <p style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 10.5, color: "#C4B8AD", lineHeight: 1.65, maxWidth: 380, marginInline: "auto" }}>
+            Estimates only — not clinical measurements or medical advice.
+            Your data stays in your browser, never uploaded.
+          </p>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DESIGN TOKENS
+// ─────────────────────────────────────────────────────────────────
+const T = {
+  card: {
+    background: "#FFFFFF",
+    borderRadius: 20,
+    padding: "20px 18px",
+    boxShadow: "0 2px 16px rgba(90,60,30,0.07), 0 1px 3px rgba(90,60,30,0.04)",
+    border: "1px solid #EDE7DF",
+  },
+  eyebrow: {
+    display: "block",
+    fontFamily: "'DM Sans',sans-serif",
+    fontSize: 9.5, letterSpacing: 2.8,
+    color: "#B0A090", textTransform: "uppercase", marginBottom: 8,
+  },
+  bodyMuted: {
+    fontFamily: "'DM Sans',sans-serif",
+    fontSize: 13.5, color: "#8A7A6C", lineHeight: 1.6, marginBottom: 22,
+  },
+  fieldGroup: {
+    display: "flex", flexDirection: "column", gap: 6, marginBottom: 14,
+  },
+  label: {
+    fontFamily: "'DM Sans',sans-serif",
+    fontSize: 11.5, fontWeight: 600, color: "#6B5748", letterSpacing: 0.2,
+  },
+  input: {
+    width: "100%", padding: "11px 13px",
+    borderRadius: 11, border: "1.5px solid #E3D9CF",
+    background: "#FDFAF7",
+    fontFamily: "'DM Sans',sans-serif", fontSize: 14, color: "#3D2B1A",
+  },
+  primaryBtn: {
+    display: "block", width: "100%", padding: "13px 20px",
+    borderRadius: 13, border: "none",
+    background: "linear-gradient(135deg, #7A4F2E, #5E3D24)",
+    color: "#FFF7F0",
+    fontFamily: "'DM Sans',sans-serif", fontSize: 14.5, fontWeight: 700, cursor: "pointer",
+    boxShadow: "0 4px 16px rgba(94,61,36,0.25)",
+    letterSpacing: 0.15,
+  },
+  disclaimer: {
+    fontFamily: "'DM Sans',sans-serif", fontSize: 10.5, color: "#C4B8AD",
+    lineHeight: 1.55, marginTop: 14,
+  },
+  stepBtn: {
+    width: 36, height: 36, borderRadius: 99,
+    border: "1.5px solid #D4C9BC", background: "#FAF6F1",
+    color: "#5E3D24", fontSize: 20, cursor: "pointer",
+    display: "flex", alignItems: "center", justifyContent: "center",
+    fontWeight: 700, fontFamily: "'DM Sans',sans-serif",
+    lineHeight: 1,
+  },
+  barLabel: {
+    fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: "#C4B8AD",
+  },
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
