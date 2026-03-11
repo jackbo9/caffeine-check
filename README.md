@@ -2,7 +2,7 @@
 
 A personal caffeine tracker that helps you stay aware of your daily intake — without the anxiety.
 
-**[→ Live demo](https://YOUR-USERNAME.github.io/caffeine-check)**
+**[→ Live demo](https://jackbo9.github.io/caffeine-check/)**
 
 ![Caffeine Check screenshot](screenshot.png)
 
